@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import date
+from collections import defaultdict
+from dataclasses import dataclass, field, replace
+from datetime import date, timedelta
 
 
 PRIORITY_RANK = {"high": 0, "medium": 1, "low": 2}
@@ -36,6 +37,13 @@ class Task:
     def mark_complete(self) -> None:
         """Mark this task as done."""
         self.completed = True
+
+    def next_occurrence(self) -> Task | None:
+        """The next copy of a daily/weekly task (due 1 or 7 days later), or None for one-off tasks."""
+        step = {"daily": timedelta(days=1), "weekly": timedelta(weeks=1)}.get(self.frequency)
+        if step is None:
+            return None
+        return replace(self, due_date=self.due_date + step, completed=False)
 
 
 @dataclass
@@ -94,10 +102,59 @@ class Scheduler:
         """Return tasks in chronological order (zero-padded HH:MM sorts correctly as text)."""
         return sorted(tasks, key=lambda t: t.time)
 
+    def sort_by_priority_then_time(self, tasks: list[Task]) -> list[Task]:
+        """High priority first; ties broken by time of day."""
+        return sorted(tasks, key=lambda t: (PRIORITY_RANK[t.priority], t.time))
+
+    def filter_tasks(self, tasks: list[Task], pet_name: str | None = None, completed: bool | None = None) -> list[Task]:
+        """Keep tasks matching a pet name and/or completion status (None means 'any')."""
+        return [
+            t for t in tasks
+            if (pet_name is None or t.pet_name.lower() == pet_name.lower())
+            and (completed is None or t.completed == completed)
+        ]
+
+    def tasks_for(self, day: date) -> list[Task]:
+        """Unfinished tasks due on the given day, across all pets."""
+        return [t for t in self.get_tasks() if t.due_date == day and not t.completed]
+
+    def detect_conflicts(self, tasks: list[Task]) -> list[str]:
+        """Warning messages for tasks booked at the exact same date and time (never raises)."""
+        slots: dict[tuple[date, str], list[Task]] = defaultdict(list)
+        for t in tasks:
+            slots[(t.due_date, t.time)].append(t)
+        return [
+            f"Conflict at {time} on {day:%b %d}: " + ", ".join(f"{t.pet_name}: {t.description}" for t in clash)
+            for (day, time), clash in sorted(slots.items())
+            if len(clash) > 1
+        ]
+
+    def mark_task_complete(self, task: Task) -> Task | None:
+        """Complete a task; if it recurs, add the next occurrence to the same pet and return it."""
+        task.mark_complete()
+        nxt = task.next_occurrence()
+        pet = self.owner.get_pet(task.pet_name)
+        if nxt and pet:
+            pet.add_task(nxt)
+        return nxt
+
     def build_daily_plan(self, day: date) -> list[Task]:
-        """Today's unfinished tasks in time order."""
-        todays = [t for t in self.get_tasks() if t.due_date == day and not t.completed]
-        return self.sort_by_time(todays)
+        """The day's plan: pick tasks by priority until the owner's time budget runs out, then order by time."""
+        plan, _ = self.plan_with_reasons(day)
+        return plan
+
+    def plan_with_reasons(self, day: date) -> tuple[list[Task], list[str]]:
+        """Like build_daily_plan, but also explains why each task was kept or skipped."""
+        budget = self.owner.available_minutes
+        chosen, reasons = [], []
+        for t in self.sort_by_priority_then_time(self.tasks_for(day)):
+            if t.duration_minutes <= budget:
+                chosen.append(t)
+                budget -= t.duration_minutes
+                reasons.append(f"Kept {t.pet_name}'s {t.description} ({t.priority} priority, {t.duration_minutes} min).")
+            else:
+                reasons.append(f"Skipped {t.pet_name}'s {t.description}: needs {t.duration_minutes} min, only {budget} min left today.")
+        return self.sort_by_time(chosen), reasons
 
     def format_schedule(self, tasks: list[Task], day: date) -> str:
         """Readable text version of a schedule for the terminal."""
